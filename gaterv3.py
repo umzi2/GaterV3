@@ -375,13 +375,13 @@ class InceptionDWConv2d(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads) -> None:
+    def __init__(self, dim, num_heads, flash=True) -> None:
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         assert dim % num_heads == 0, "dim must be divisible by num_heads"
         self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
-
+        self.register_buffer("flash", torch.tensor([flash]))
         self.qkv = nn.Conv2d(dim, dim * 3, kernel_size=1, bias=False)
         self.qkv_dwconv = nn.Conv2d(dim * 3, dim * 3, 3, 1, 1, 1, dim * 3)
         self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=False)
@@ -396,19 +396,24 @@ class Attention(nn.Module):
         q = q.view(b, self.num_heads, self.head_dim, h * w)
         k = k.view(b, self.num_heads, self.head_dim, h * w)
         v = v.view(b, self.num_heads, self.head_dim, h * w)
+        if self.flash.item():
+            out = F.scaled_dot_product_attention(
+                q.transpose(2, 3), k.transpose(2, 3), v.transpose(2, 3), is_causal=False
+            )
+            out = out.transpose(2, 3).contiguous().view(b, c, h, w)
+        else:
+            q = F.normalize(q, dim=3)
+            k = F.normalize(k, dim=3)
 
-        q = F.normalize(q, dim=3)
-        k = F.normalize(k, dim=3)
+            attn = (
+                torch.matmul(q, k.transpose(2, 3)) * self.temperature
+            )  # (b, num_heads, hw, hw)
+            attn = attn.softmax(dim=3)
 
-        attn = (
-            torch.matmul(q, k.transpose(2, 3)) * self.temperature
-        )  # (b, num_heads, hw, hw)
-        attn = attn.softmax(dim=3)
+            out = torch.matmul(attn, v)  # (b, num_heads, head_dim, hw)
 
-        out = torch.matmul(attn, v)  # (b, num_heads, head_dim, hw)
-
-        # Обратно в (b, c, h, w)
-        out = out.view(b, c, h, w)
+            # Обратно в (b, c, h, w)
+            out = out.view(b, c, h, w)
 
         out = self.project_out(out)
         return out
@@ -426,6 +431,7 @@ class GatedCNNBlock(nn.Module):
         expansion_ratio: float = 1.5,
         conv_ratio: float = 1,
         att=False,
+        flash=True,
     ) -> None:
         super().__init__()
         self.norm = RMSNorm(dim)
@@ -435,7 +441,9 @@ class GatedCNNBlock(nn.Module):
         self.act = nn.Mish()
         conv_channels = int(conv_ratio * dim)
         self.split_indices = [hidden, hidden - conv_channels, conv_channels]
-        self.token_mix = Attention(conv_channels, 16) if att else InceptionDWConv2d(dim)
+        self.token_mix = (
+            Attention(conv_channels, 16, flash) if att else InceptionDWConv2d(dim)
+        )
         self.fc2 = nn.Conv2d(hidden, dim, 1, 1, 0)
         self.apply(self._init_weights)
 
@@ -479,6 +487,8 @@ class MetaGated(nn.Module):
         self.glob = GatedCNNBlock(dim)
         self.gamma0 = nn.Parameter(torch.ones([1, dim, 1, 1]), requires_grad=True)
         self.gamma1 = nn.Parameter(torch.ones([1, dim, 1, 1]), requires_grad=True)
+        self.gamma0.register_hook(lambda grad: grad * 10)
+        self.gamma1.register_hook(lambda grad: grad * 10)
         self.apply(self._init_weights)
 
     @staticmethod
@@ -523,7 +533,7 @@ class Block(nn.Module):
         else:
             self.scale = Upsample(dim)
             self.gated = nn.Sequential(*[MetaGated(dim // 2) for _ in range(num_gated)])
-            self.shor = nn.Conv2d(int(dim), dim // 2, 1, 1, 0)
+            self.shor = nn.Conv2d(dim, dim // 2, 1, 1, 0)
         self.down = down
 
     def forward(self, x, short=None):
@@ -535,21 +545,25 @@ class Block(nn.Module):
             x = self.shor(x)
             return self.gated(x)
 
-
 class GateRV3(nn.Module):
     def __init__(
         self,
         in_ch=3,
         dim=32,
-        enc_blocks=(2, 2, 4, 8),
+        enc_blocks=(2, 2, 4, 6),
         dec_blocks=(2, 2, 2, 2),
-        num_latent=12,
-        scale=1,
-        upsample: SampleMods = "pixelshuffledirect",
-        upsample_mid_dim=32,
+        num_latent=8,
+        scale=2,
+        upsample: SampleMods = "pixelshuffle",
+        upsample_mid_dim=48,
+        end_gamma_init=1,
+        attention=False,
+        sisr_blocks=4,
+        flash=True,
         **kwargs,
     ) -> None:
         super().__init__()
+
         self.scale = scale
         self.in_to_dim = nn.Conv2d(in_ch, dim, 3, 1, 1)
         self.gater_encode = nn.ModuleList(
@@ -557,7 +571,7 @@ class GateRV3(nn.Module):
         )
         self.span_block0 = SPAB(dim, end=False)
         self.span_n_b = nn.Sequential(
-            *[SPAB(dim, end=False) for _ in range(len(enc_blocks))]
+            *[SPAB(dim, end=False) for _ in range(sisr_blocks)]
         )
         self.span_end = SPAB(dim, end=True)
         self.sisr_end_conv = Conv3XC(dim, dim, bias=True)
@@ -569,7 +583,8 @@ class GateRV3(nn.Module):
                     dim * (2 ** len(enc_blocks)),
                     expansion_ratio=1.5,
                     conv_ratio=1.00,
-                    att=True,
+                    att=attention,
+                    flash=flash,
                 )
                 for _ in range(num_latent)
             ]
@@ -585,12 +600,13 @@ class GateRV3(nn.Module):
             ]
         )
         self.pad = 2 ** (len(enc_blocks))
-        # self.dim_to_in = nn.Conv2d(dim*2, in_ch, 3, 1, 1)
+
+        self.gamma = nn.Parameter(torch.ones(1, in_ch, 1, 1) * end_gamma_init)
+        self.gamma.register_hook(lambda grad: grad * 10)
 
         if scale != 1:
             self.short_to_dim = nn.Upsample(scale_factor=scale)  # ConvBlock(in_ch, dim)
             self.dim_to_in = UniUpsample(upsample, scale, dim, in_ch, upsample_mid_dim)
-            # self.upsample =
         else:
             self.dim_to_in = nn.Conv2d(dim, in_ch, 3, 1, 1)
             self.short_to_dim = nn.Identity()
@@ -598,6 +614,8 @@ class GateRV3(nn.Module):
     def load_state_dict(self, state_dict, *args, **kwargs):
         if "dim_to_in.MetaUpsample" in state_dict:
             state_dict["dim_to_in.MetaUpsample"] = self.dim_to_in.MetaUpsample
+        if "gamma" not in state_dict:
+            state_dict["gamma"] = self.gamma
         return super().load_state_dict(state_dict, *args, **kwargs)
 
     def check_img_size(self, x, resolution: tuple[int, int]):
@@ -618,7 +636,8 @@ class GateRV3(nn.Module):
         sisr = self.sisr_cat_conv(torch.cat([x, sisr, sisr_short, sisr_out], dim=1))
         del sisr_short, sisr_out
         shorts = []
-        for block in self.gater_encode:
+
+        for index, block in enumerate(self.gater_encode):
             x, short = block(x)
             shorts.append(short)
 
@@ -628,5 +647,5 @@ class GateRV3(nn.Module):
         for index in range(len_block):
             x = self.decode[index](x, shorts[index])
 
-        x = self.dim_to_in(x + sisr) + self.short_to_dim(inp)
+        x = self.dim_to_in(x + sisr) + self.gamma * self.short_to_dim(inp)
         return x[:, :, : H * self.scale, : W * self.scale]
